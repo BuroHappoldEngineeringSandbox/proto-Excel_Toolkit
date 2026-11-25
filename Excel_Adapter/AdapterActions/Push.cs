@@ -1,0 +1,268 @@
+/*
+ * This file is part of the Buildings and Habitats object Model (BHoM)
+ * Copyright (c) 2015 - 2026, the respective contributors. All rights reserved.
+ *
+ * Each contributor holds copyright over their respective contributions.
+ * The project versioning (Git) records all such contribution source information.
+ *                                           
+ *                                                                              
+ * The BHoM is free software: you can redistribute it and/or modify         
+ * it under the terms of the GNU Lesser General Public License as published by  
+ * the Free Software Foundation, either version 3.0 of the License, or          
+ * (at your option) any later version.                                          
+ *                                                                              
+ * The BHoM is distributed in the hope that it will be useful,              
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of               
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the                 
+ * GNU Lesser General Public License for more details.                          
+ *                                                                            
+ * You should have received a copy of the GNU Lesser General Public License     
+ * along with this code. If not, see <https://www.gnu.org/licenses/lgpl-3.0.html>.      
+ */
+
+using BH.Engine.Adapter;
+using BH.Engine.Excel;
+using BH.oM.Adapter;
+using BH.oM.Adapters.Excel;
+using ClosedXML.Excel;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+
+namespace BH.Adapter.Excel
+{
+    public partial class ExcelAdapter : BHoMAdapter
+    {
+        /***************************************************/
+        /**** Public Overrides                          ****/
+        /***************************************************/
+
+        public override List<object> Push(IEnumerable<object> objects, string tag = "", PushType pushType = PushType.AdapterDefault, ActionConfig actionConfig = null)
+        {
+            // Make sure there are objects to push
+            if (objects == null || !objects.Any())
+            {
+                BH.Engine.Base.Compute.RecordError("No objects were provided for Push action.");
+                return new List<object>();
+            }
+            objects = objects.Where(x => x != null).ToList();
+
+            // Make sure an output stream has been provided if the input is read through a stream
+            if (m_InputStream != null && m_OutputStream == null)
+            {
+                BH.Engine.Base.Compute.RecordError("Please set the Stream for the output to enable the push to work correctly.");
+                return new List<object>();
+            }
+
+            // If unset, set the pushType to AdapterSettings' value (base AdapterSettings default is FullCRUD).
+            if (pushType == PushType.AdapterDefault)
+                pushType = PushType.DeleteThenCreate;
+
+            // Cast action config to ExcelPushConfig, create new if null.
+            ExcelPushConfig config = actionConfig as ExcelPushConfig;
+            if (config == null && !(objects.FirstOrDefault() is PushItem))
+            {
+                BH.Engine.Base.Compute.RecordNote($"{nameof(ExcelPushConfig)} has not been provided, default config is used.");
+                config = new ExcelPushConfig();
+            }
+
+            // Make sure that a single type of objects are pushed
+            List<Type> objectTypes = objects.Select(x => x.GetType()).Distinct().ToList();
+            if (objectTypes.Count != 1)
+            {
+                string message = "The Excel adapter only allows to push objects of a single type to a table."
+                    + "\nRight now you are providing objects of the following types: "
+                    + objectTypes.Select(x => x.ToString()).Aggregate((a, b) => a + ", " + b);
+                Engine.Base.Compute.RecordError(message);
+                return new List<object>();
+            }
+
+            // Check if the workbook exists and create it if not.
+            XLWorkbook workbook = null;
+            if (m_FileSettings != null)
+                workbook = CreateWorkbookFromFile(m_FileSettings.GetFullFileName(), pushType);
+            else if (m_InputStream != null)
+                workbook = CreateWorkbookFromStream(m_InputStream);
+            else
+            {
+                BH.Engine.Base.Compute.RecordError("File settings or template stream have not been provided.");
+                return new List<object>();
+            }
+
+            // Push the objects
+            List<object> pushedObjects = new List<object>();
+            if (objects.FirstOrDefault() is PushItem)
+            {
+                foreach (PushItem item in objects.OfType<PushItem>())
+                {
+                    if (PushObjects(workbook, item.Objects, item.Config, pushType))
+                        pushedObjects.AddRange(item.Objects);
+                }
+            }
+            else
+            {
+                if (PushObjects(workbook, objects.ToList(), config, pushType))
+                    pushedObjects = objects.ToList();
+            }
+
+            // Try to update the workbook properties and then save it.
+            try
+            {
+                if (config != null)
+                    Update(workbook, config.WorkbookProperties);
+
+                if (m_FileSettings != null)
+                    workbook.SaveAs(m_FileSettings.GetFullFileName());
+                else if (m_OutputStream != null)
+                {
+                    workbook.SaveAs(m_OutputStream);
+                    m_OutputStream.Position = 0;
+                }
+                else
+                {
+                    BH.Engine.Base.Compute.RecordError("Output stream has not been provided. The workbook cannot be saved.");
+                    return new List<object>();
+                }
+
+                return pushedObjects;
+            }
+            catch (Exception e)
+            {
+                BH.Engine.Base.Compute.RecordError($"Finalisation and saving of the workbook failed with the following error: {e.Message}");
+                return new List<object>();
+            }
+        }
+
+        /***************************************************/
+        /**** Private Methods                           ****/
+        /***************************************************/
+
+        private bool PushObjects(XLWorkbook workbook, List<object> objects, ExcelPushConfig config, PushType pushType = PushType.AdapterDefault)
+        {
+            // Makwe sure the config is defined
+            if (config == null)
+            {
+                BH.Engine.Base.Compute.RecordNote($"{nameof(ExcelPushConfig)} has not been provided, default config is used.");
+                config = new ExcelPushConfig();
+            }
+
+            // Make sure that a single type of objects are pushed
+            List<Type> objectTypes = objects.Select(x => x.GetType()).Distinct().ToList();
+            if (objectTypes.Count != 1)
+            {
+                string message = "The Excel adapter only allows to push objects of a single type per table."
+                    + "\nRight now you are providing objects of the following types: "
+                    + objectTypes.Select(x => x.ToString()).Aggregate((a, b) => a + ", " + b);
+                Engine.Base.Compute.RecordError(message);
+                return false;
+            }
+
+            // Split the tables into collections to delete, create and update.
+            bool success = true;
+            string sheetName = config.Worksheet;
+
+            List<TableRow> data = new List<TableRow>();
+            if (objects.All(x => x is TableRow))
+                data = objects.OfType<TableRow>().ToList();
+            else
+                data = objects.ToTableRows(config);
+
+            switch (pushType)
+            {
+                case PushType.CreateNonExisting:
+                    {
+                        if (workbook.Worksheets.All(x => x.Name != sheetName))
+                            success &= Create(workbook, sheetName, data, config);
+                        break;
+                    }
+                case PushType.DeleteThenCreate:
+                    {
+                        if (workbook.Worksheets.Any(x => x.Name == sheetName))
+                            success &= Delete(workbook, sheetName);
+                        success &= Create(workbook, sheetName, data, config);
+                        break;
+                    }
+                case PushType.UpdateOnly:
+                    {
+                        success &= Update(workbook, sheetName, data, config);
+                        break;
+                    }
+                case PushType.UpdateOrCreateOnly:
+                    {
+                        if (workbook.Worksheets.All(x => x.Name != sheetName))
+                            success &= Create(workbook, sheetName, data, config);
+                        else
+                            success &= Update(workbook, sheetName, data, config);
+                        break;
+                    }
+                default:
+                    {
+                        BH.Engine.Base.Compute.RecordError($"Currently Excel adapter does not supports {nameof(PushType)} equal to {pushType}");
+                        return false;
+                    }
+            }
+
+            return success;
+        }
+
+
+        /***************************************************/
+
+        private XLWorkbook CreateWorkbookFromFile(string fileName, PushType pushType)
+        {
+            XLWorkbook workbook = null;
+            if (!File.Exists(fileName))
+            {
+                if (pushType == PushType.UpdateOnly)
+                {
+                    BH.Engine.Base.Compute.RecordError($"There is no workbook to update under {fileName}");
+                    return null;
+                }
+
+                workbook = new XLWorkbook();
+            }
+            else
+            {
+                try
+                {
+                    workbook = new XLWorkbook(fileName);
+                }
+                catch (Exception e)
+                {
+                    BH.Engine.Base.Compute.RecordError($"The existing workbook could not be accessed due to the following error: {e.Message}");
+                    return null;
+                }
+            }
+
+            return workbook;
+        }
+
+        /***************************************************/
+
+        private XLWorkbook CreateWorkbookFromStream(Stream inputStream)
+        {
+            try
+            {
+                return new XLWorkbook(inputStream);
+            }
+            catch (Exception e)
+            {
+                BH.Engine.Base.Compute.RecordError($"The existing workbook could not be accessed due to the following error: {e.Message}");
+                return null;
+            }
+        }
+
+
+        /***************************************************/
+
+
+        /*******************************************/
+    }
+}
+
+
+
+
+
+
